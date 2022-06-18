@@ -10,6 +10,7 @@ import math
 import torch.nn.functional as F
 
 
+
 class Trainer(object):
     def __init__(self, settings: Option, model: nn.Module, recorder=None):
         # init params

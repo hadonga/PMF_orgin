@@ -10,8 +10,8 @@ experiment_id: "baseline_timestamp"
 val_only: false
 has_label: true
 is_debug: false
-n_epochs: 50
-batch_size: [3, 3]
+n_epochs: 10
+batch_size: [1, 1]
 lr: 0.001
 lr_decay: 0.99
 warmup_epochs: 1
@@ -21,7 +21,7 @@ val_frequency: 1
 
 dataset: "nuScenes"
 nclasses: 17 # 16+1(ignored)
-data_root: "/path/to/nuscenes/"
+data_root: "/usb/hd2t/nusc/"
 
 base_channels: 32
 img_backbone: "resnet34"
