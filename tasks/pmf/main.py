@@ -5,6 +5,13 @@ import os
 import torch
 import time
 import trainer
+import wandb
+
+run= wandb.init(project='MFnet',
+           name=f"augdata_orgmodel",
+           config={"dataset":"augdata",
+                   "architecture":"PMF",
+                   "epochs":20})
 
 import pc_processor
 
@@ -37,7 +44,9 @@ class Experiment(object):
             nclasses=self.settings.nclasses,
             base_channels=self.settings.base_channels,
             image_backbone=self.settings.img_backbone,
-            imagenet_pretrained=self.settings.imagenet_pretrained
+            # imagenet_pretrained=self.settings.imagenet_pretrained,
+            imagenet_pretrained = True
+
         )
 
         # init trainer
@@ -112,6 +121,11 @@ class Experiment(object):
                                 self.recorder.checkpoint_path, "best_{}_model.pth".format(k))
                             best_val_result[k] = v
                             torch.save(self.model.state_dict(), saved_path)
+                            # artifact=wandb.Artifact('best_model',type='model')
+                            # artifact.add_file(saved_path)
+                            # run.log_artifact(artifact)
+                            # run.join()
+
 
             # save checkpoint
             if self.recorder is not None:
@@ -123,8 +137,12 @@ class Experiment(object):
                     "aux_optimizer": self.trainer.aux_optimizer.state_dict(),
                     "epoch": epoch,
                 }
-
                 torch.save(checkpoint_data, saved_path)
+
+                # artifact = wandb.Artifact('checkpoint', type='model')
+                # artifact.add_file(saved_path)
+                # run.log_artifact(artifact)
+                # run.join()
                 # log
                 if best_val_result is not None:
                     log_str = ">>> Best Result: "
@@ -132,10 +150,11 @@ class Experiment(object):
                         log_str += "{}: {} ".format(k, v)
                     self.recorder.logger.info(log_str)
         cost_time = time.time() - t_start
+
         if self.recorder is not None:
             self.recorder.logger.info("==== total cost time: {}".format(
                 datetime.timedelta(seconds=cost_time)))
-
+        wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Experiment Options")

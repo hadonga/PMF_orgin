@@ -25,7 +25,7 @@ data_root: "/path/to/sensat-urban/"
 # model config
 base_channels: 48
 img_backbone: "resnet101"
-imagenet_pretrained: true
+imagenet_pretrained: True
 
 # cehckpoint model
 checkpoint: null 

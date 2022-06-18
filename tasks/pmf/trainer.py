@@ -9,6 +9,7 @@ import pc_processor
 import math
 import torch.nn.functional as F
 
+import wandb
 
 class Trainer(object):
     def __init__(self, settings: Option, model: nn.Module, recorder=None):
@@ -98,65 +99,32 @@ class Trainer(object):
         return optimizer
 
     def _initDataloader(self):
-        if self.settings.dataset == "SemanticKitti":
-            data_config_path = "../../pc_processor/dataset/semantic_kitti/semantic-kitti.yaml"
-            trainset = pc_processor.dataset.semantic_kitti.SemanticKitti(
-                root=self.settings.data_root,
-                sequences=[0,1,2,3,4,5,6,7,9,10],
-                config_path=data_config_path
-            )
-            self.cls_weight = 1 / (trainset.cls_freq + 1e-3)
-            self.ignore_class = []
-            for cl, w in enumerate(self.cls_weight):
-                if trainset.data_config["learning_ignore"][cl]:
-                    self.cls_weight[cl] = 0
-                if self.cls_weight[cl] < 1e-10:
-                    self.ignore_class.append(cl)
-            if self.recorder is not None:
-                self.recorder.logger.info("weight: {}".format(self.cls_weight))
-            self.mapped_cls_name = trainset.mapped_cls_name
 
-            valset = pc_processor.dataset.semantic_kitti.SemanticKitti(
-                root=self.settings.data_root,
-                sequences=[8],
-                config_path=data_config_path
-            )
-
-        elif self.settings.dataset == "nuScenes":
-            trainset = pc_processor.dataset.nuScenes.Nuscenes(
-                root=self.settings.data_root, version="v1.0-trainval", split="train",
-            )
-            valset = pc_processor.dataset.nuScenes.Nuscenes(
-                root=self.settings.data_root, version="v1.0-trainval", split="val",
-            )
+        if self.settings.dataset == "nuScenes":
+            train_pv_loader = pc_processor.dataset.new_nuScenes(self.settings.data_root, 'train')
+            val_pv_loader = pc_processor.dataset.new_nuScenes(self.settings.data_root, 'val')
             self.cls_weight = np.ones((self.settings.nclasses))
             self.ignore_class = [0]
-            self.mapped_cls_name = trainset.mapped_cls_name
+            self.mapped_cls_name = train_pv_loader.mapped_cls_name
         else:
             raise ValueError(
                 "invalid dataset: {}".format(self.settings.dataset))
 
-        train_pv_loader = pc_processor.dataset.PerspectiveViewLoader(
-            dataset=trainset,
-            config=self.settings.config,
-            is_train=True, pcd_aug=False, img_aug=True, use_padding=True)
 
-        val_pv_loader = pc_processor.dataset.PerspectiveViewLoader(
-            dataset=valset,
-            config=self.settings.config,
-            is_train=False, use_padding=True)
 
         if self.settings.distributed:
+            print(train_pv_loader.__len__())
             train_sampler = torch.utils.data.distributed.DistributedSampler(
-                trainset, shuffle=True, drop_last=True)
+                train_pv_loader, shuffle=True, drop_last=True)
             val_sampler = torch.utils.data.distributed.DistributedSampler(
-                valset, shuffle=False, drop_last=False)
+                val_pv_loader, shuffle=False, drop_last=False)
+
             train_loader = torch.utils.data.DataLoader(
                 train_pv_loader,
                 batch_size=self.settings.batch_size[0],
                 num_workers=self.settings.n_threads,
                 drop_last=True,
-                sampler=train_sampler
+                sampler=train_sampler,
             )
 
             val_loader = torch.utils.data.DataLoader(
@@ -164,7 +132,7 @@ class Trainer(object):
                 batch_size=self.settings.batch_size[1],
                 num_workers=self.settings.n_threads,
                 drop_last=False,
-                sampler=val_sampler
+                sampler=val_sampler,
             )
             return train_loader, val_loader, train_sampler, val_sampler
 
@@ -190,11 +158,8 @@ class Trainer(object):
         criterion["lovasz"] = pc_processor.loss.Lovasz_softmax(ignore=0)
 
         criterion["kl_loss"] = nn.KLDivLoss(reduction="none")
-        
-        if self.settings.dataset == "SemanticKitti":
-            alpha = np.log(1+self.cls_weight)
-            alpha = alpha / alpha.max()
-        elif self.settings.dataset == "nuScenes":
+
+        if self.settings.dataset == "nuScenes":
             alpha = np.ones((self.settings.nclasses))
         alpha[0] = 0
         if self.recorder is not None:
@@ -286,16 +251,22 @@ class Trainer(object):
         feature_std = torch.Tensor(self.settings.config["sensor"]["img_stds"]).unsqueeze(
             0).unsqueeze(2).unsqueeze(2).cuda()
 
-        for i, (input_feature, input_mask, input_label) in enumerate(dataloader):
+        for i, batch in enumerate(dataloader):
             t_process_start = time.time()
-            input_feature = input_feature.cuda()
-            input_mask = input_mask.cuda()
-            input_feature[:, 0:5] = (
-                input_feature[:, 0:5] - feature_mean) / feature_std * \
-                input_mask.unsqueeze(1).expand_as(input_feature[:, 0:5])
-            pcd_feature = input_feature[:, 0:5]
-            img_feature = input_feature[:, 5:8]
-            input_label = input_label.cuda().long()
+
+            # input_feature = batch["pcd_feature"].cuda()
+            # input_mask = input_mask.cuda()
+            # input_feature[:, 0:5] = (
+            #     input_feature[:, 0:5] - feature_mean) / feature_std * \
+            #     input_mask.unsqueeze(1).expand_as(input_feature[:, 0:5])
+            # pcd_feature = input_feature[:, 0:5]
+            # img_feature = input_feature[:, 5:8]
+            # input_label = input_label.cuda().long()
+            # label_mask = input_label.gt(0)
+
+            pcd_feature = batch['pcd_feature'].float().cuda()
+            img_feature = batch['img_feature'].float().cuda()
+            input_label = batch['pcd_labels'].float().cuda().long()
             label_mask = input_label.gt(0)
 
             # forward propergation
@@ -395,16 +366,16 @@ class Trainer(object):
                 mean_acc_img, class_acc_img = self.metrics_img.getAcc()
                 mean_recall_img, class_recall_img = self.metrics_img.getRecall()
 
-            loss_meter.update(total_loss.item(), input_feature.size(0))
-            loss_focal_meter.update(loss_foc.item(), input_feature.size(0))
-            loss_lovasz_meter.update(loss_lov.item(), input_feature.size(0))
-            entropy_meter.update(pcd_entropy.mean().item(), input_feature.size(0))
+            loss_meter.update(total_loss.item(), pcd_feature.size(0))
+            loss_focal_meter.update(loss_foc.item(), pcd_feature.size(0))
+            loss_lovasz_meter.update(loss_lov.item(), pcd_feature.size(0))
+            entropy_meter.update(pcd_entropy.mean().item(), pcd_feature.size(0))
 
-            loss_img_lovasz_meter.update(loss_lov_cam.item(), input_feature.size(0))
-            loss_img_focal_meter.update(loss_foc_cam.item(), input_feature.size(0))
-            entropy_img_meter.update(img_entropy.mean().item(), input_feature.size(0))
+            loss_img_lovasz_meter.update(loss_lov_cam.item(), pcd_feature.size(0))
+            loss_img_focal_meter.update(loss_foc_cam.item(), pcd_feature.size(0))
+            entropy_img_meter.update(img_entropy.mean().item(), pcd_feature.size(0))
 
-            loss_perception_meter.update(loss_per.item(), input_feature.size(0))
+            loss_perception_meter.update(loss_per.item(), pcd_feature.size(0))
 
             # timer logger ----------------------------------------
             t_process_end = time.time()
@@ -423,21 +394,36 @@ class Trainer(object):
                 for g in self.optimizer.param_groups:
                     lr = g["lr"]
                     break
-                log_str = ">>> {} E[{:03d}|{:03d}] I[{:04d}|{:04d}] DT[{:.3f}] PT[{:.3f}] ".format(
-                    mode, self.settings.n_epochs, epoch+1, total_iter, i+1, data_cost_time, process_cost_time)
-                log_str += "LR {:0.5f} Loss {:0.4f} Acc {:0.4f} IOU {:0.4F} Recall {:0.4f} Entropy {:0.4f} ".format(
-                    lr, loss.item(), mean_acc.item(), mean_iou.item(), mean_recall.item(), entropy_meter.avg)
-                log_str += "ImgAcc {:0.4f} ImgIOU {:0.4F} ImgRecall {:0.4f} ImgEntropy {:0.4f} ".format(
-                    mean_acc_img.item(), mean_iou_img.item(), mean_recall_img.item(), entropy_img_meter.avg)
-                log_str += "RT {}".format(remain_time)
-                self.recorder.logger.info(log_str)
+                if i % self.settings.print_frequency == 0:
+                    log_str = ">>> {} E[{:03d}|{:03d}] I[{:04d}|{:04d}] DT[{:.3f}] PT[{:.3f}] ".format(
+                        mode, self.settings.n_epochs, epoch+1, total_iter, i+1, data_cost_time, process_cost_time)
+                    log_str += "LR {:0.5f} Loss {:0.4f} Acc {:0.4f} IOU {:0.4F} Recall {:0.4f} Entropy {:0.4f} ".format(
+                        lr, loss.item(), mean_acc.item(), mean_iou.item(), mean_recall.item(), entropy_meter.avg)
+                    log_str += "ImgAcc {:0.4f} ImgIOU {:0.4F} ImgRecall {:0.4f} ImgEntropy {:0.4f} ".format(
+                        mean_acc_img.item(), mean_iou_img.item(), mean_recall_img.item(), entropy_img_meter.avg)
+                    log_str += "RT {}".format(remain_time)
+                    self.recorder.logger.info(log_str)
+                    wandb.log({"Total Loss":loss.item(),
+                               "PCD_mIoU":mean_iou.item(),"PCD_Accuracy":mean_acc.item(),
+                               "Img_mIoU": mean_iou_img.item(), "Img_Accuracy": mean_acc_img.item()})
 
             if self.settings.is_debug:
                 break
 
+        # record one epoch result
         # tensorboard logger
+        # wandb logger
         if self.recorder is not None:
-            # scalar log
+            # pcd wandb logger
+            wandb.log({"{}_Loss".format(mode): loss_meter.avg,
+                       "{}_LossFocal".format(mode) : loss_focal_meter.avg,
+                       "{}_LossLovasz".format(mode): loss_lovasz_meter.avg,
+                       "{}_meanAcc".format(mode): mean_acc.item(),
+                       "{}_meanIOU".format(mode):mean_iou.item(),
+                       "{}_meanRecall".format(mode):mean_recall.item(),
+                       })
+
+            # pcd tensorboard logger
             self.recorder.tensorboard.add_scalar(
                 tag="{}_Loss".format(mode), scalar_value=loss_meter.avg, global_step=epoch)
             self.recorder.tensorboard.add_scalar(
@@ -465,7 +451,16 @@ class Trainer(object):
                 self.recorder.tensorboard.add_scalar(
                     tag="{}_{:02d}_{}_IOU".format(mode, i, v), scalar_value=class_iou[i].item(), global_step=epoch)
 
-            # record img branch acc, recall and iou
+            # img wandb logger
+            wandb.log({
+                       "{}_LossImgFocal".format(mode): loss_img_focal_meter.avg,
+                       "{}_LossImgLovasz".format(mode): loss_img_lovasz_meter.avg,
+                       "{}_Image_meanAcc".format(mode): mean_acc_img.item(),
+                       "{}_Image_meanIOU".format(mode): mean_iou_img.item(),
+                       "{}_Image_meanRecall".format(mode): mean_recall_img.item(),
+                       })
+
+            # img tensorboard logger
             self.recorder.tensorboard.add_scalar(
                 tag="{}_LossImageFocal".format(mode), scalar_value=loss_img_focal_meter.avg, global_step=epoch)
             self.recorder.tensorboard.add_scalar(
@@ -491,37 +486,37 @@ class Trainer(object):
                 self.recorder.tensorboard.add_scalar(
                     tag="{}_{:02d}_{}_ImageIOU".format(mode, i, v), scalar_value=class_iou_img[i].item(), global_step=epoch)
 
-            if epoch % self.settings.print_frequency == 0 and self.settings.dataset != "nuScenes":
-                # img log
-                for i in range(pcd_feature.size(1)):
-                    self.recorder.tensorboard.add_image(
-                        "{}_PCDFeature_{}".format(mode, i), pcd_feature[0, i:i+1].cpu(), epoch)
-
-                if camera_pred is not None:
-                    for i in range(camera_pred.size(1)):
-                        self.recorder.tensorboard.add_image(
-                            "{}_RGBPred_cls_{:02d}_{}".format(mode, i, self.mapped_cls_name[i]), camera_pred[0, i:i+1].cpu(), epoch)
-
-                for i in range(lidar_pred.size(1)):
-                    self.recorder.tensorboard.add_image(
-                        "{}_Pred_cls_{:02d}_{}".format(mode, i, self.mapped_cls_name[i]), lidar_pred[0, i:i+1].cpu(), epoch)
-
-                # record entropy
-                self.recorder.tensorboard.add_image(
-                    "{}_PredEntropy".format(mode), pcd_entropy[0].unsqueeze(0), epoch)
-                self.recorder.tensorboard.add_image(
-                    "{}_RGBPredEntropy".format(mode), img_entropy[0].unsqueeze(0), epoch)
-                self.recorder.tensorboard.add_image(
-                    "{}_RGBGuideWeight".format(mode), img_guide_weight[0].unsqueeze(0), epoch)
-                self.recorder.tensorboard.add_image(
-                    "{}_PCDGuideWeight".format(mode), pcd_guide_weight[0].unsqueeze(0), epoch)
-
-                for i in range(lidar_pred.size(1)):
-                    self.recorder.tensorboard.add_image("{}_Label_cls_{:02d}_{}".format(
-                        mode, i, self.mapped_cls_name[i]), input_label[0:1].eq(i).cpu(), epoch)
-
-                self.recorder.tensorboard.add_image(
-                    "{}_RGB".format(mode), img_feature[0].cpu(), epoch)
+            # if epoch % self.settings.print_frequency == 0 and self.settings.dataset != "nuScenes":
+            #     # img log
+            #     for i in range(pcd_feature.size(1)):
+            #         self.recorder.tensorboard.add_image(
+            #             "{}_PCDFeature_{}".format(mode, i), pcd_feature[0, i:i+1].cpu(), epoch)
+            #
+            #     if camera_pred is not None:
+            #         for i in range(camera_pred.size(1)):
+            #             self.recorder.tensorboard.add_image(
+            #                 "{}_RGBPred_cls_{:02d}_{}".format(mode, i, self.mapped_cls_name[i]), camera_pred[0, i:i+1].cpu(), epoch)
+            #
+            #     for i in range(lidar_pred.size(1)):
+            #         self.recorder.tensorboard.add_image(
+            #             "{}_Pred_cls_{:02d}_{}".format(mode, i, self.mapped_cls_name[i]), lidar_pred[0, i:i+1].cpu(), epoch)
+            #
+            #     # record entropy
+            #     self.recorder.tensorboard.add_image(
+            #         "{}_PredEntropy".format(mode), pcd_entropy[0].unsqueeze(0), epoch)
+            #     self.recorder.tensorboard.add_image(
+            #         "{}_RGBPredEntropy".format(mode), img_entropy[0].unsqueeze(0), epoch)
+            #     self.recorder.tensorboard.add_image(
+            #         "{}_RGBGuideWeight".format(mode), img_guide_weight[0].unsqueeze(0), epoch)
+            #     self.recorder.tensorboard.add_image(
+            #         "{}_PCDGuideWeight".format(mode), pcd_guide_weight[0].unsqueeze(0), epoch)
+            #
+            #     for i in range(lidar_pred.size(1)):
+            #         self.recorder.tensorboard.add_image("{}_Label_cls_{:02d}_{}".format(
+            #             mode, i, self.mapped_cls_name[i]), input_label[0:1].eq(i).cpu(), epoch)
+            #
+            #     self.recorder.tensorboard.add_image(
+            #         "{}_RGB".format(mode), img_feature[0].cpu(), epoch)
 
             log_str = ">>> {} Loss {:0.4f} Acc {:0.4f} IOU {:0.4F} Recall {:0.4f}".format(
                 mode, loss_meter.avg, mean_acc.item(), mean_iou.item(), mean_recall.item())
